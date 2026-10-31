@@ -1,0 +1,60 @@
+;; aura/common.aura — 通用工具（沿用 aura-eda-agents）：环境变量、确定性随机数、后台子进程 + fiber 轮询、文件 I/O
+;;
+;; 约定：lowering / 编译 / 评测（tools/*.py）以子进程运行，结果写文件；
+;; Aura 侧只做编排 / 决策 / 门禁 / 审计。json-parse 只在主 fiber 里做（aura#4788 的规避）。
+
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define (hget h k d) (if (and (hash? h) (hash-has-key? h k)) (hash-ref h k) d))
+(define (safe th d) (try (th) (catch (e) d)))
+(define (range n) (let loop ((i (- n 1)) (acc (list))) (if (< i 0) acc (loop (- i 1) (cons i acc)))))
+(define (join-strings xs sep)
+  (if (null? xs) "" (foldl (lambda (acc x) (string-append acc sep x)) (car xs) (cdr xs))))
+(define (r2 x) (/ (round (* x 100.0)) 100.0))
+(define (absf x) (if (< x 0) (- 0 x) x))
+(define (sum xs) (foldl + 0 xs))
+(define (mean xs) (if (null? xs) 0 (/ (* 1.0 (sum xs)) (length xs))))
+(define (take xs n) (if (or (<= n 0) (null? xs)) (list) (cons (car xs) (take (cdr xs) (- n 1)))))
+(define (list-index-of xs x)
+  (let loop ((ys xs) (i 0)) (cond ((null? ys) -1) ((equal? (car ys) x) i) (else (loop (cdr ys) (+ i 1))))))
+(define (set-nth xs i v) (if (= i 0) (cons v (cdr xs)) (cons (car xs) (set-nth (cdr xs) (- i 1) v))))
+(define (argmax f xs)   ;; 第一个取得最大值的元素（确定性）
+  (if (null? xs) #f
+      (let loop ((ys (cdr xs)) (best (car xs)) (bv (f (car xs))))
+        (if (null? ys) best
+            (let ((v (f (car ys)))) (if (> v bv) (loop (cdr ys) (car ys) v) (loop (cdr ys) best bv)))))))
+(define (nums->csv xs) (join-strings (map (lambda (x) (number->string x)) xs) ","))
+
+;; ---- 确定性 LCG（同一种子 -> 同一序列；方法之间互不共享状态）----
+(define (rng-make seed) (list (modulo (+ (* seed 7919) 12345) 2147483647)))
+(define (rng-next! r)
+  (let ((v (modulo (+ (* (car r) 1103515245) 12345) 2147483648)))
+    (set-car! r v) v))
+(define (rng-int! r n) (modulo (quotient (rng-next! r) 16) n))
+(define (rng-float! r) (/ (* 1.0 (rng-int! r 1000000)) 1000000.0))
+(define (rng-pick! r xs) (list-ref xs (rng-int! r (length xs))))
+
+;; ---- 子进程 ----
+(define *py* (env-or "PY" "python3"))
+(define (run! cmd)   ;; 阻塞运行，失败抛错
+  (let ((rc (sh cmd))) (if (= rc 0) #t (error (format "command failed rc=~a: ~a" rc cmd)))))
+(define (run-bg! cmd done)   ;; 后台运行，结束后写 done 文件（内容是退出码）
+  (sh (string-append "rm -f " done))
+  (sh (string-append "( " cmd " ; echo $? > " done " ) >/dev/null 2>&1 &")))
+(define (await-file done)
+  (let loop ((n 0))
+    (let ((v (safe (lambda () (read-file done)) #f)))
+      (if (and (string? v) (> (string-length v) 0)) v
+          (begin (sh "sleep 0.02") (fiber:yield) (loop (+ n 1)))))))
+(define (read-json path) (json-parse (read-file path)))
+
+;; 开一个总会回报结果的 fiber。参数在 fiber 内重新 let 绑定（aura#4781 的规避）。
+(define (spawn-reporting ch tag th)
+  (fiber:spawn (lambda ()
+    (let ((ch ch) (tag tag) (th th))
+      (let ((v (try (th) (catch (e) (list 'error tag (format "~a" e))))))
+        (channel:send ch v))
+      tag))))
+
+(define (append-line! path s)
+  (let ((old (safe (lambda () (read-file path)) "")))
+    (write-file path (string-append (if (string? old) old "") s "\n"))))

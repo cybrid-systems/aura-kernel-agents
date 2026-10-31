@@ -26,13 +26,13 @@ SEMANTICS = {
 SPACE = {
     "matmul": {"order": ["ijk", "ikj", "jik", "jki", "kij", "kji"], "tile-i": [0, 8, 16, 32, 64, 128],
                "tile-j": [0, 32, 64, 128, 256, 512], "tile-k": [0, 16, 32, 64, 128, 256],
-               "unroll": [1, 2, 4, 8], "vec": [1, 4, 8, 16]},
+               "unroll": [1, 2, 4, 8], "vec": [1, 4, 8, 16], "micro": [0, 2, 4, 6, 8]},
     "softmax": {"passes": [3, 2], "exp": ["libm", "poly"], "unroll": [1, 2, 4], "vec": [1, 4, 8, 16]},
     "layernorm": {"stats": ["two-pass", "sumsq"], "acc": ["f32", "f64"], "unroll": [1, 2, 4], "vec": [1, 4, 8, 16]},
     "reduce": {"acc": ["f32", "f64"], "unroll": [1, 2, 4, 8], "vec": [1, 4, 8, 16]},
 }
 START = {
-    "matmul": {"order": "ijk", "tile-i": 0, "tile-j": 0, "tile-k": 0, "unroll": 1, "vec": 1},
+    "matmul": {"order": "ijk", "tile-i": 0, "tile-j": 0, "tile-k": 0, "unroll": 1, "vec": 1, "micro": 0},
     "softmax": {"passes": 3, "exp": "libm", "unroll": 1, "vec": 1},
     "layernorm": {"stats": "two-pass", "acc": "f32", "unroll": 1, "vec": 1},
     "reduce": {"acc": "f64", "unroll": 1, "vec": 1},
@@ -87,8 +87,8 @@ def prelude(W, need_exp=False, need_f64=False):
     s = ["#include <math.h>", "#include <string.h>", "#include <stddef.h>",
          "typedef float vf __attribute__((vector_size(%d), aligned(4)));" % (4 * W),
          "typedef int vi __attribute__((vector_size(%d), aligned(4)));" % (4 * W),
-         "static inline vf ld(const float* p) { vf v; memcpy(&v, p, sizeof v); return v; }",
-         "static inline void st(float* p, vf v) { memcpy(p, &v, sizeof v); }",
+         "static inline vf ld(const float* p) { return *(const vf*)p; }   /* vf 带 aligned(4)：生成非对齐向量访存 */",
+         "static inline void st(float* p, vf v) { *(vf*)p = v; }",
          "static inline vf splat(float x) { vf v = {0}; return v + x; }",
          "static inline vf vmax(vf a, vf b) { vi m = a > b; return (vf)(((vi)a & m) | ((vi)b & ~m)); }",
          "static inline float hsum(vf v) { float s = 0; for (int l = 0; l < %d; l++) s += v[l]; return s; }" % W,
@@ -107,7 +107,7 @@ def prelude(W, need_exp=False, need_f64=False):
               "  vf p = splat(1.9875691500e-4f); p = p * f + 1.3981999507e-3f; p = p * f + 8.3334519073e-3f;",
               "  p = p * f + 4.1665795894e-2f; p = p * f + 1.6666665459e-1f; p = p * f + 5.0000001201e-1f;",
               "  p = p * f * f + f + 1.0f;",
-              "  vi e = (n + 127) << 23; vf sc; memcpy(&sc, &e, sizeof sc); return p * sc; }"]
+              "  vi e = (n + 127) << 23; return p * (vf)e; }"]
     return s
 
 
@@ -126,6 +126,30 @@ def lower_matmul(d):
         else:
             emit("{ int %s0 = 0, %s1 = %s;" % (v, v, D[v]))
         ind += 1; closes += 1
+    if d["micro"] and W > 1:   # 寄存器分块微内核：RB 行 × (W*U) 列的累加器常驻寄存器，k 最内；忽略 order
+        RB = d["micro"]
+        emit("int i = i0;")
+        emit("for (; i + %d <= i1; i += %d) {" % (RB, RB)); ind += 1
+        emit("int j = j0;")
+        emit("for (; j + %d <= j1; j += %d) {" % (W * U, W * U)); ind += 1
+        emit(" ".join("vf c%d_%d = splat(0.0f);" % (r, u) for r in range(RB) for u in range(U)))
+        emit("for (int k = k0; k < k1; k++) {"); ind += 1
+        emit("const float* restrict b = B + (size_t)k * N + j; " + " ".join("vf b%d = ld(b + %d);" % (u, u * W) for u in range(U)))
+        for r in range(RB):
+            emit("{ const float a = A[(size_t)(i + %d) * K + k]; %s }" % (r, " ".join("c%d_%d += a * b%d;" % (r, u, u) for u in range(U))))
+        ind -= 1; emit("}")
+        for r in range(RB):
+            emit(" ".join("st(C + (size_t)(i + %d) * N + j + %d, ld(C + (size_t)(i + %d) * N + j + %d) + c%d_%d);" % (r, u * W, r, u * W, r, u) for u in range(U)))
+        ind -= 1; emit("}")
+        emit("for (; j < j1; j++) for (int r = 0; r < %d; r++) { float s = 0; for (int k = k0; k < k1; k++) s += A[(size_t)(i + r) * K + k] * B[(size_t)k * N + j]; C[(size_t)(i + r) * N + j] += s; }" % RB)
+        ind -= 1; emit("}")
+        emit("for (; i < i1; i++) for (int k = k0; k < k1; k++) { const float a = A[(size_t)i * K + k]; int j = j0;")
+        emit("  for (; j + %d <= j1; j += %d) st(C + (size_t)i * N + j, ld(C + (size_t)i * N + j) + a * ld(B + (size_t)k * N + j));" % (W, W))
+        emit("  for (; j < j1; j++) C[(size_t)i * N + j] += a * B[(size_t)k * N + j]; }")
+        for _ in range(closes):
+            ind -= 1; emit("}")
+        L.append("}")
+        return L
     for v in o[:2]:
         emit("for (int %s = %s0; %s < %s1; %s++) {" % (v, v, v, v, v)); ind += 1; closes += 1
     x = o[2]

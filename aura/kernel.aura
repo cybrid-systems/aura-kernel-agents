@@ -1,0 +1,161 @@
+;; aura/kernel.aura — 把"内核程序"放进 live AST，用结构化变异 + 快照/回滚 + fiber 并行评测做搜索
+;;
+;; 内核 = 一棵调度 S 表达式（Halide 风格：算法固定、调度可变），住在 live AST 的 kernel-cur 里：
+;;   (matmul (order i k j) (tile-i 64) (tile-j 256) (tile-k 128) (unroll 2) (vec 16))
+;; 每一轮：
+;;   提议（随机结构变异 或 LLM 只提议旋钮修改）→ kernel-legal? 契约（非法提议不花评测预算）→ 去重
+;;   → 每个候选一个 fiber：lowering + 编译 + 隔离评测（编译并行，计时段由评测器 flock 串行、绑核）
+;;   → 主 fiber 裁决：最优且快 ≥2% 的候选：ast:snapshot → mutate:rebind kernel-cur → 确认复测（新随机输入）
+;;   → 复测仍更快则保留，否则 ast:restore 回到快照（真正回退代码，不是改变量）
+;; 所有提议、裁决写 trials.tsv；每次运行结束导出 Aura 自己的 (query :mutation-log)。
+
+(define *space* #f)
+(define (load-space!)
+  (run! "mkdir -p build && python3 tools/kgen.py space > build/space.json")
+  (set! *space* (read-json "build/space.json")))
+(define (op-knobs op) (hash-ref (hash-ref *space* op) "knobs"))
+(define (op-start op) (hash-ref (hash-ref *space* op) "start"))
+
+;; ---- AST 工具 ----
+(define (vstr vals) (join-strings (map (lambda (v) (format "~a" v)) vals) ""))       ;; (i k j) -> "ikj"，(32) -> "32"
+(define (ast-op a) (format "~a" (car a)))
+(define (ast-knobs a) (map (lambda (n) (format "~a" (car n))) (cdr a)))
+;; 注意：本 pin 上 string->symbol 返回的是字符串（symbol? 为 #f，见 docs/aura-issues.md），所以按名字（format ~a）比较，不用 eq?/assq
+(define (knob-node a k) (let ((ns (filter (lambda (n) (equal? (format "~a" (car n)) k)) (cdr a)))) (if (null? ns) #f (car ns))))
+(define (ast-get a k) (let ((n (knob-node a k))) (if n (vstr (cdr n)) #f)))
+(define (ast-set a k vals) (cons (car a) (map (lambda (n) (if (equal? (format "~a" (car n)) k) (cons (car n) vals) n)) (cdr a))))
+(define (space-strs op k) (map (lambda (v) (format "~a" v)) (hash-ref (op-knobs op) k)))
+(define (value->vals k v)   ;; 空间里的取值（整数或字符串）-> AST 节点的值列表
+  (cond ((equal? k "order") (map (lambda (i) (string->symbol (substring v i (+ i 1)))) (range (string-length v))))
+        ((number? v) (list v))
+        (else (list (string->symbol (format "~a" v))))))
+(define (ast->string a) (format "~a" a))
+
+;; ---- 契约：非法 AST 不进入评测 ----
+(define (kernel-legal? a)    ;; -> #f（合法）或 原因字符串
+  (let* ((op (ast-op a)) (kn (op-knobs op)))
+    (let loop ((ks (ast-knobs a)))
+      (cond ((null? ks)
+             (if (and (equal? op "matmul") (not (equal? (ast-get a "vec") "1"))
+                      (not (equal? (substring (ast-get a "order") 2 3) "j")))
+                 "matmul: vec>1 要求最内层是 j（连续维）"
+                 (if (and (equal? op "matmul") (not (equal? (ast-get a "micro") "0")) (equal? (ast-get a "vec") "1"))
+                     "matmul: micro>0（寄存器分块）要求 vec>1" #f)))
+            ((not (hash-has-key? kn (car ks))) (format "未知旋钮 ~a" (car ks)))
+            ((not (member (ast-get a (car ks)) (space-strs op (car ks)))) (format "非法取值 ~a=~a" (car ks) (ast-get a (car ks))))
+            (else (loop (cdr ks)))))))
+
+;; ---- 结构化随机变异 ----
+(define (mutate-random a r)
+  (let* ((op (ast-op a)) (k (rng-pick! r (ast-knobs a))))
+    (if (equal? k "order")
+        (let* ((o (cdr (knob-node a "order"))) (p (rng-int! r 2)))   ;; 交换相邻两层循环
+          (list (ast-set a k (if (= p 0) (list (cadr o) (car o) (caddr o)) (list (car o) (caddr o) (cadr o)))) (format "swap-loops ~a" p)))
+        (let* ((vals (hash-ref (op-knobs op) k)) (n (length vals)) (i (list-index-of (space-strs op k) (ast-get a k)))
+               (j (if (< (rng-float! r) 0.7)
+                      (let ((d (if (= (rng-int! r 2) 0) -1 1))) (if (or (< (+ i d) 0) (>= (+ i d) n)) (- i d) (+ i d)))
+                      (modulo (+ i 1 (rng-int! r (- n 1))) n))))
+          (list (ast-set a k (value->vals k (list-ref vals j))) (format "~a ~a->~a" k (ast-get a k) (list-ref vals j)))))))
+
+;; LLM 提议（hash：旋钮 -> 取值）应用到 incumbent；未知旋钮直接判非法
+(define (apply-changes a ch)
+  (let loop ((ks (hash-keys ch)) (b a))
+    (cond ((null? ks) (list b #f))
+          ((not (member (car ks) (ast-knobs a))) (list a (format "未知旋钮 ~a" (car ks))))
+          (else (loop (cdr ks) (ast-set b (car ks) (value->vals (car ks) (hash-ref ch (car ks)))))))))
+
+;; ---- 评测（子进程）----
+(define (eval-cmd op s cdir)
+  (format "mkdir -p ~a && python3 tools/kgen.py lower --ast '~a' --out ~a/k.c > ~a/lower.json && python3 tools/keval.py eval --op ~a --src ~a/k.c --out ~a/res.json > /dev/null"
+          cdir s cdir cdir op cdir cdir))
+(define (eval-batch! op asts dir tag)   ;; 并行：每个候选一个 fiber；返回与 asts 同序的结果 hash 列表
+  (let* ((ch (channel:create 16)) (n (length asts)))
+    (for-each (lambda (i)
+                (let ((cdir (format "~a/~a-~a" dir tag i)) (s (ast->string (list-ref asts i))))
+                  (spawn-reporting ch i (lambda ()
+                    (let ((done (string-append cdir ".done")))
+                      (run-bg! (eval-cmd op s cdir) done) (await-file done) (list i cdir))))))
+              (range n))
+    (let* ((got (map (lambda (_) (channel:recv ch)) (range n))))
+      (map (lambda (i)
+             (let ((g (car (filter (lambda (x) (or (equal? (car x) i) (and (equal? (car x) 'error) (equal? (cadr x) i)))) got))))
+               (if (equal? (car g) 'error) (status-hash "aura-error")
+                   (safe (lambda () (read-json (string-append (cadr g) "/res.json"))) (status-hash "lower-error")))))
+           (range n)))))
+(define (status-hash st) (let ((h (hash))) (hash-set! h "status" st) h))
+(define (res-ms r) (if (equal? (hget r "status" "") "ok") (hget r "ms_geo" #f) #f))
+
+;; ---- 一次搜索 ----
+(define (search! op method seed budget width dir)
+  (run! (format "rm -rf ~a && mkdir -p ~a" dir dir))
+  (set-code (format "(define kernel-cur (lambda () (quote ~a)))" (op-start op))) (eval-current)
+  (let* ((r (rng-make (+ seed (* 1000 (string-length op))))) (seen (list (ast->string (kernel-cur))))
+         (trials (string-append dir "/trials.tsv")) (hist (string-append dir "/hist.tsv"))
+         (start (car (eval-batch! op (list (kernel-cur)) dir "start"))) (inc-ms (res-ms start))
+         (evals 0) (confirms 1) (round 0) (stall 0) (cnt (hash)) (t0 (current-time-ms)))
+    (define (bump! k) (hash-set! cnt k (+ 1 (hget cnt k 0))))
+    (define (log! it s status ms what decision)
+      (append-line! trials (format "~a\t~a\t~a\t~a\t~a\t~a\t~a" it s status ms what decision (r2 inc-ms))))
+    (write-file trials "it\tast\tstatus\tms\tmutation\tdecision\tinc_ms\n")
+    (write-file hist (format "~a\tok\t~a\n" (ast->string (kernel-cur)) (r2 inc-ms)))
+    (log! 0 (ast->string (kernel-cur)) "ok" inc-ms "start" "start")
+    (let loop ()
+      (if (and (< evals budget) (< stall 5))
+          (let* ((want (min width (- budget evals))) (cur (kernel-cur))
+                 (raw (if (equal? method "aura-llm")
+                          (let ((pf (format "~a/props-~a.json" dir round)))
+                            (run! (format "python3 tools/llm_mutate.py --op ~a --cur '~a' --hist ~a --width ~a --left ~a --dir ~a --out ~a"
+                                          op (ast->string cur) hist want (- budget evals) dir pf))
+                            (let ((pj (read-json pf)))
+                              (if (hget pj "fallback" #t) (bump! "llm_fallback") #f)
+                              (map (lambda (ch) (append (apply-changes cur ch) (list (format "llm ~a" (join-strings (map (lambda (k) (format "~a=~a" k (hash-ref ch k))) (hash-keys ch)) ","))))) (hget pj "proposals" (list)))))
+                          (list)))
+                 (cands (list)))
+            ;; 过契约 + 去重；不够的用随机结构变异补足（LLM 方法里记为 fallback）
+            (for-each (lambda (p)
+                        (let* ((a (car p)) (why (if (cadr p) (cadr p) (kernel-legal? a))) (s (ast->string a)))
+                          (cond (why (bump! "illegal") (log! evals s "illegal" "" (caddr p) why))
+                                ((member s seen) (bump! "dup") (log! evals s "dup" "" (caddr p) "已评估"))
+                                (else (set! seen (cons s seen)) (set! cands (cons (list a (caddr p)) cands))))))
+                      raw)
+            (let fill ((tries 0))
+              (if (and (< (length cands) want) (< tries 200))
+                  (let* ((m (mutate-random cur r)) (a (car m)) (s (ast->string a)) (why (kernel-legal? a)))
+                    (cond (why (bump! "illegal_random"))
+                          ((member s seen) (bump! "dup_random"))
+                          (else (set! seen (cons s seen)) (set! cands (cons (list a (cadr m)) cands))
+                                (if (equal? method "aura-llm") (bump! "random_fill") #f)))
+                    (fill (+ tries 1)))
+                  #f))
+            (set! cands (reverse cands))
+            (if (null? cands) (set! stall (+ stall 1)) (set! stall 0))   ;; 邻域耗尽保护：连续 5 轮无新候选则停
+            (let* ((rs (eval-batch! op (map car cands) dir (format "r~a" round)))
+                   (best #f) (best-ms #f))
+              (for-each (lambda (c res)
+                          (let ((ms (res-ms res)) (st (hget res "status" "?")))
+                            (set! evals (+ evals 1)) (bump! st)
+                            (append-line! hist (format "~a\t~a\t~a" (ast->string (car c)) st (if ms (r2 ms) "")))
+                            (log! evals (ast->string (car c)) st (if ms ms "") (cadr c) (if ms (if (< ms inc-ms) "faster" "slower") "reject"))
+                            (if (and ms (or (not best-ms) (< ms best-ms))) (begin (set! best c) (set! best-ms ms)) #f)))
+                        cands rs)
+              ;; 裁决：快 ≥2% -> 快照、rebind、确认复测（候选与旧 incumbent 各用新随机输入再测一次）；复测不成立 -> ast:restore
+              (if (and best-ms (< best-ms (* 0.98 inc-ms)))
+                  (let* ((prev (kernel-cur)) (s (ast->string (car best)))
+                         (snap (ast:snapshot (format "~a-~a-s~a-r~a" op method seed round))))
+                    (mutate:rebind "kernel-cur" (format "(lambda () (quote ~a))" s) (format "~a ~a s~a r~a: ~a" op method seed round (cadr best)))
+                    (eval-current)
+                    (let* ((cf (eval-batch! op (list (kernel-cur) prev) dir (format "c~a" round)))
+                           (m1 (res-ms (car cf))) (m0 (res-ms (cadr cf))))
+                      (set! confirms (+ confirms 2))
+                      (if (and m1 m0 (equal? (ast->string (kernel-cur)) s) (< m1 (* 0.99 m0)))
+                          (begin (bump! "keep") (set! inc-ms (/ (+ best-ms m1) 2.0))
+                                 (log! evals s "ok" m1 "confirm" (format "KEEP（复测 ~a vs 旧 ~a）" (r2 m1) (r2 m0))))
+                          (begin (bump! "rollback") (ast:restore snap) (eval-current)
+                                 (log! evals s "ok" (if m1 m1 "") "confirm"
+                                       (format "ROLLBACK（复测 ~a vs 旧 ~a）-> 回到 ~a" (if m1 (r2 m1) "?") (if m0 (r2 m0) "?") (ast->string (kernel-cur))))))))
+                  #f))
+            (set! round (+ round 1))
+            (loop))
+          #f))
+    (write-file (string-append dir "/best.ast") (ast->string (kernel-cur)))
+    (list cnt evals confirms (- (current-time-ms) t0) (ast->string (kernel-cur)) inc-ms (res-ms start))))
