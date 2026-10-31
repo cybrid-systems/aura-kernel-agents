@@ -48,7 +48,7 @@
 噪声说明：实验期间 box 上并行跑着另一个 ORFS 实验（load ~4）；计时已串行并绑核，但 reduce（32 MB 流式读，受共享 L3/内存带宽影响）复测波动约 ±15%，其差异不显著。
 
 ## Aura 的问题与差距
-见 [`docs/aura-issues.md`](docs/aura-issues.md)（`string->symbol` 返回字符串导致的死循环、无有理数字面量、无 C/GPU lowering 后端、增量编译不覆盖下游 C、契约无法表达数值合法性……）。设计细节见 [`docs/design.md`](docs/design.md)。
+见 [`docs/aura-issues.md`](docs/aura-issues.md)（已提 aura#4798–#4803 并修复/部分实现；`string->symbol` 返回字符串导致的死循环、无有理数字面量、无 C/GPU lowering 后端、增量编译不覆盖下游 C、契约无法表达数值合法性……）。设计细节见 [`docs/design.md`](docs/design.md)。
 
 ## 复现
 ```bash

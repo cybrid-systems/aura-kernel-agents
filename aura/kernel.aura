@@ -20,7 +20,7 @@
 (define (vstr vals) (join-strings (map (lambda (v) (format "~a" v)) vals) ""))       ;; (i k j) -> "ikj"，(32) -> "32"
 (define (ast-op a) (format "~a" (car a)))
 (define (ast-knobs a) (map (lambda (n) (format "~a" (car n))) (cdr a)))
-;; 注意：本 pin 上 string->symbol 返回的是字符串（symbol? 为 #f，见 docs/aura-issues.md），所以按名字（format ~a）比较，不用 eq?/assq
+;; 注意：pin 5af7fd023 上 string->symbol 返回的是字符串（symbol? 为 #f），aura#4798 已在 main 修复；为兼容实验 pin，仍按名字（format ~a）比较，新旧版本都正确
 (define (knob-node a k) (let ((ns (filter (lambda (n) (equal? (format "~a" (car n)) k)) (cdr a)))) (if (null? ns) #f (car ns))))
 (define (ast-get a k) (let ((n (knob-node a k))) (if n (vstr (cdr n)) #f)))
 (define (ast-set a k vals) (cons (car a) (map (lambda (n) (if (equal? (format "~a" (car n)) k) (cons (car n) vals) n)) (cdr a))))
