@@ -8,7 +8,7 @@
 (define *width* (string->number (env-or "AKB_WIDTH" "2")))
 (define out (env-or "AKB_OUT" "results/aura_runs.tsv"))
 (define cols (list "illegal" "dup" "illegal_random" "dup_random" "ok" "compile_error" "incorrect" "hack" "timeout" "crash" "lower-error" "aura-error" "keep" "rollback" "llm_fallback" "random_fill"))
-(if (safe (lambda () (read-file out)) #f) #f
+(if (string? (safe (lambda () (read-file out)) #f)) #f   ;; read-file 对不存在的文件返回 '()（真值），要用 string? 判断
     (write-file out (string-append "op\tseed\tmethod\tstart_ms\tbest_ms\tevals\tconfirms\twall_ms\tbest_ast\t" (join-strings cols "\t") "\n")))
 (for-each (lambda (op)
   (for-each (lambda (seed)

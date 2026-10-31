@@ -1,0 +1,22 @@
+;; uses: kernel.aura
+;; 冒烟测试：去掉 workaround 后的 AST 工具 / fiber 回报 / hash 构造（需要 aura main ≥ 1df09aa16）
+;; 运行：scripts/dev.sh 'scripts/aura.sh tests/test_kernel_ast.aura'
+(define *fails* 0)
+(define (check! p msg) (if p (display (format "  pass: ~a\n" msg)) (begin (set! *fails* (+ *fails* 1)) (display (format "  FAIL: ~a\n" msg)))))
+(define a '(matmul (order i k j) (tile-i 64) (vec 16)))
+(check! (symbol? (string->symbol "tile-i")) "string->symbol 返回 symbol（aura#4798）")
+(check! (equal? (knob-node a "tile-i") '(tile-i 64)) "knob-node 用 assq 找到旋钮")
+(check! (not (knob-node a "tile-x")) "未知旋钮 -> #f")
+(check! (equal? (ast-get a "order") "ikj") "ast-get order")
+(define b (ast-set a "vec" (value->vals "vec" 8)))
+(check! (equal? b '(matmul (order i k j) (tile-i 64) (vec 8))) "ast-set 保持 symbol 名并替换值")
+(check! (equal? (ast-set a "order" (value->vals "order" "kij")) '(matmul (order k i j) (tile-i 64) (vec 16))) "order 取值转 symbol 列表")
+(check! (equal? (hash-ref (status-hash "x") "status") "x") "(hash k v) 构造（aura#4800）")
+(check! (safe (lambda () (hash "status") #f) #t) "(hash k) 奇数参数报错（aura#4800）")
+(define ch (channel:create 4))
+(spawn-reporting ch 7 (lambda () (error "boom")))
+(spawn-reporting ch 8 (lambda () (list 8 (json-parse "{\"status\":\"ok\"}"))))
+(define got (list (channel:recv ch) (channel:recv ch)))
+(check! (pair? (filter (lambda (g) (and (eq? (car g) 'error) (equal? (cadr g) 7))) got)) "fiber 内 catch 能看到外层参数（aura#4781）")
+(check! (pair? (filter (lambda (g) (and (equal? (car g) 8) (hash? (cadr g)))) got)) "子 fiber 内 json-parse（aura#4788）")
+(if (= *fails* 0) (display "KERNEL-AST-OK\n") (begin (display (format "KERNEL-AST-FAIL ~a\n" *fails*)) (exit 1)))

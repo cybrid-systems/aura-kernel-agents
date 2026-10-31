@@ -1,7 +1,7 @@
 ;; aura/common.aura — 通用工具（沿用 aura-eda-agents）：环境变量、确定性随机数、后台子进程 + fiber 轮询、文件 I/O
 ;;
 ;; 约定：lowering / 编译 / 评测（tools/*.py）以子进程运行，结果写文件；
-;; Aura 侧只做编排 / 决策 / 门禁 / 审计。json-parse 只在主 fiber 里做（aura#4788 的规避）。
+;; Aura 侧只做编排 / 决策 / 门禁 / 审计。
 
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 (define (hget h k d) (if (and (hash? h) (hash-has-key? h k)) (hash-ref h k) d))
@@ -47,13 +47,11 @@
           (begin (sh "sleep 0.02") (fiber:yield) (loop (+ n 1)))))))
 (define (read-json path) (json-parse (read-file path)))
 
-;; 开一个总会回报结果的 fiber。参数在 fiber 内重新 let 绑定（aura#4781 的规避）。
+;; 开一个总会回报结果的 fiber（aura#4781 修复后 catch 里可直接引用外层参数，不再重新 let 绑定）。
 (define (spawn-reporting ch tag th)
   (fiber:spawn (lambda ()
-    (let ((ch ch) (tag tag) (th th))
-      (let ((v (try (th) (catch (e) (list 'error tag (format "~a" e))))))
-        (channel:send ch v))
-      tag))))
+    (channel:send ch (try (th) (catch (e) (list 'error tag (format "~a" e)))))
+    tag)))
 
 (define (append-line! path s)
   (let ((old (safe (lambda () (read-file path)) "")))
