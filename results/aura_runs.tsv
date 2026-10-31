@@ -1,0 +1,1 @@
+matmul	1	aura-random	6.540377177607114	0.3571263161809271	16	11	12844	(matmul (order i k j) (tile-i 8) (tile-j 0) (tile-k 16) (unroll 1) (vec 16) (micro 0))	0	0	1	2	16	0	0	0	0	0	0	0	5	0	0	0

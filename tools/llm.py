@@ -21,6 +21,12 @@ def chat(provider, system, user, log_path, tag="", max_tokens=16000, timeout=300
             raise RuntimeError("未设置 LLM_ALLOW_NETWORK=1")
         body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tokens}
+        if provider == "deepseek":   # 推理模型会把 16k 预算全花在 reasoning 上（实测 no_code），默认关闭思考（off）；也可设 low/medium，但实测 low 对难题仍会烧满预算
+            eff = os.environ.get("LLM_REASONING", "off"); rec["reasoning"] = eff
+            if eff == "off":
+                body["thinking"] = {"type": "disabled"}
+            else:
+                body["reasoning_effort"] = eff
         req = urllib.request.Request(base.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), method="POST",
                                      headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
         last = None
