@@ -1,0 +1,1 @@
+# matmul s1 aura-random 行在一次中止重跑后由 runs/ 下的 trials.tsv 重建（illegal_random/dup_random 未记录 → NA）

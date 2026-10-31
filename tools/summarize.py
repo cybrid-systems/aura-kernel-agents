@@ -96,6 +96,27 @@ def cmd_report(a):
                 m, len(rows), fm, (start or fm) / fm, tb / fm, sol_score(fm, tb, ts),
                 " / ".join(at(k) for k in (4, 8, 12, 16)), ",".join(str(r) if r else "未达" for r in reach),
                 inv["compile_error"], inv["incorrect"], inv["hack"], inv["other"], pre_t))
+    L.append("\n### 成本（每次运行平均）\n")
+    L.append("| 算子 | 方法 | 墙钟 s | LLM 调用 | LLM token（总） | LLM 平均延迟 s |")
+    L.append("|---|---|---|---|---|---|")
+    aw = {}
+    if os.path.exists(a.aura):
+        for r in csv.DictReader(open(a.aura), delimiter="\t"):
+            aw.setdefault((r["op"], r["method"]), []).append(float(r["wall_ms"]) / 1000)
+    for op in data:
+        for m in sorted(data[op]):
+            ws, calls, toks, lat = [], 0, 0, []
+            for s, tr, pre, d in data[op][m]:
+                rj = os.path.join(d, "result.json")
+                if os.path.exists(rj):
+                    ws.append(json.load(open(rj))["wall_s"])
+                lj = os.path.join(d, "llm_calls.jsonl")
+                if os.path.exists(lj):
+                    for line in open(lj):
+                        r = json.loads(line); calls += 1; toks += (r.get("usage") or {}).get("total_tokens", 0); lat.append(r["latency_s"])
+            ws = ws or aw.get((op, m), []); n = len(data[op][m])
+            L.append("| %s | %s | %.1f | %.1f | %.0f | %s |" % (op, m, statistics.mean(ws) if ws else float("nan"), calls / n, toks / n,
+                                                         "%.1f" % statistics.mean(lat) if lat else "–"))
     open(a.out, "w").write("\n".join(L) + "\n"); print("\n".join(L))
 
 
@@ -105,6 +126,7 @@ def main():
     s = sp.add_parser("report")
     for k in ("runs", "final", "calib", "base", "out"):
         s.add_argument("--" + k, required=True)
+    s.add_argument("--aura", default="results/aura_runs.tsv")
     a = p.parse_args(); {"remeasure": cmd_remeasure, "report": cmd_report}[a.cmd](a)
 
 
